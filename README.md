@@ -56,7 +56,7 @@ So, as expected, one packet should be stuck in `sch_direct_xmit()`, and the othe
 
 > The experiment environment:
 >
-> It’s a Virtualbox VM with Debian 11 (bullseye) system.
+> It’s a Virtualbox VM with Debian 11 (bullseye) system with 4 CPU.
 
 ```shell
 # cat /etc/os-release
@@ -153,7 +153,7 @@ But, the world does not work expectedly.
 
 ## Run the demo
 
-When the VM prepares, run the demo:
+When the 4-CPUs VM prepares, run the demo:
 
 ```shell
 # apt install -y git clang-15 llvm-15
@@ -172,3 +172,5 @@ When the VM prepares, run the demo:
 ## In conclusion
 
 Wow, congrad, the issue is reproduced.
+
+Fake it. This is a way to reproduce the issue.
