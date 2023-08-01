@@ -15,8 +15,10 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"github.com/cilium/ebpf"
+	"github.com/cilium/ebpf/btf"
 	"github.com/cilium/ebpf/link"
 	"github.com/cilium/ebpf/perf"
 	"github.com/cilium/ebpf/rlimit"
@@ -25,12 +27,24 @@ import (
 	"golang.org/x/sync/errgroup"
 )
 
-//go:generate bpf2go -cc clang tp ./ebpf/tp-stuck-it.c -- -D__TARGET_ARCH_x86 -I./ebpf/headers -Wall
+//go:generate bpf2go -cc clang -no-global-types tp ./ebpf/tp-stuck-it.c -- -D__TARGET_ARCH_x86 -I./ebpf/headers -Wall
 
 func main() {
-	var remote string
-	flag.StringVarP(&remote, "remote", "r", "", "remote address")
+	var tsDiff, single bool
+	var remote, btfFile string
+	flag.StringVarP(&remote, "remote", "r", "192.168.1.2", "remote address")
+	flag.StringVarP(&btfFile, "btf", "b", "", "btf file")
+	flag.BoolVarP(&tsDiff, "ts-diff", "t", false, "print timestamp diff")
+	flag.BoolVarP(&single, "single", "s", false, "send one packet every time; send two packets every time otherwise")
 	flag.Parse()
+
+	if tsDiff {
+		arg1, arg2 := flag.Args()[0], flag.Args()[1]
+		ts1, _ := time.ParseDuration(arg1 + "ns")
+		ts2, _ := time.ParseDuration(arg2 + "ns")
+		fmt.Printf("%s - %s = %s\n", arg1, arg2, ts1-ts2)
+		return
+	}
 
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
 
@@ -42,7 +56,7 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	ping, err := newPinging(remote)
+	ping, err := newPinging(remote, single)
 	if err != nil {
 		log.Fatalf("Failed to create pinging: %v", err)
 	}
@@ -56,6 +70,14 @@ func main() {
 
 	if err := rlimit.RemoveMemlock(); err != nil {
 		log.Fatalf("Failed to remove rlimit memlock: %v", err)
+	}
+
+	var btfSpec *btf.Spec
+	if btfFile != "" {
+		btfSpec, err = btf.LoadSpec(btfFile)
+		if err != nil {
+			log.Fatalf("Failed to load btf spec: %v", err)
+		}
 	}
 
 	var randData [1 << 18]byte
@@ -76,7 +98,8 @@ func main() {
 	var obj tpObjects
 	if err := spec.LoadAndAssign(&obj, &ebpf.CollectionOptions{
 		Programs: ebpf.ProgramOptions{
-			LogSize: 1000 * ebpf.DefaultVerifierLogSize,
+			LogSize:     1000 * ebpf.DefaultVerifierLogSize,
+			KernelTypes: btfSpec,
 		},
 	}); err != nil {
 		var ve *ebpf.VerifierError
@@ -89,24 +112,49 @@ func main() {
 	}
 	defer obj.Close()
 
-	tps := []struct {
-		category string
-		name     string
-		prog     *ebpf.Program
+	tracings := []struct {
+		prog *ebpf.Program
+		name string
 	}{
-		// {"qdisc", "qdisc_dequeue", obj.HandleQdiscDequeue},
-		{"net", "net_dev_start_xmit", obj.HandleNetDevStartXmit},
-		{"net", "net_dev_xmit", obj.HandleNetDevXmit},
+		{obj.FentryQdiscRun, "fentry(__qdisc_run)"},
+		{obj.FexitQdiscRun, "fexit(__qdisc_run)"},
+		{obj.FexitDevQueueXmit, "fexit(__dev_queue_xmit)"},
+		{obj.FentryNetifSchedule, "fentry(__netif_schedule)"},
+		{obj.FentryPfifoFastDequeue, "fentry(__pfifo_fast_dequeue)"},
+		{obj.FexitPfifoFastDequeue, "fexit(__pfifo_fast_dequeue)"},
+		{obj.FentryPfifoFastEnqueue, "fentry(__pfifo_fast_enqueue)"},
+		{obj.FexitPfifoFastEnqueue, "fexit(__pfifo_fast_enqueue)"},
+		{obj.FentryNetTxAction, "fentry(__net_tx_action)"},
+		{obj.FexitNetTxAction, "fexit(__net_tx_action)"},
+		{obj.FentrySchDirectXmit, "fentry(__sch_direct_xmit)"},
 	}
 
-	for _, tp := range tps {
-		if link, err := link.Tracepoint(tp.category, tp.name, tp.prog, nil); err != nil {
-			log.Printf("Failed to attach tracepoint(%s:%s)): %v", tp.category, tp.name, err)
+	for _, t := range tracings {
+		if link, err := link.AttachTracing(link.TracingOptions{
+			Program: t.prog,
+		}); err != nil {
+			log.Printf("Failed to attach %s: %v", t.name, err)
 			return
 		} else {
-			log.Printf("Attached tracepoint(%s:%s))", tp.category, tp.name)
+			log.Printf("Attached %s", t.name)
 			defer link.Close()
 		}
+	}
+
+	if tp, err := link.Tracepoint("qdisc", "qdisc_dequeue", obj.HandleQdiscDequeue, nil); err != nil {
+		log.Printf("Failed to attach tracepoint(qdisc:qdisc_dequeue): %v", err)
+		return
+	} else {
+		log.Printf("Attached tracepoint(qdisc:qdisc_dequeue)")
+		defer tp.Close()
+	}
+
+	if tp, err := link.Tracepoint("net", "net_dev_queue", obj.HandleNetDevQueue, nil); err != nil {
+		log.Printf("Failed to attach tracepoint(net:net_dev_queue): %v", err)
+		return
+	} else {
+		log.Printf("Attached tracepoint(net:net_dev_queue)")
+		defer tp.Close()
 	}
 
 	agent.Listen(agent.Options{
@@ -121,7 +169,7 @@ func main() {
 	})
 
 	errg.Go(func() error {
-		return handlePerfEvent(ctx, obj.Events)
+		return handlePerfEvent(ctx, obj.Events, obj.StackMap)
 	})
 
 	if err := errg.Wait(); err != nil {
@@ -131,7 +179,13 @@ func main() {
 	}
 }
 
-func handlePerfEvent(ctx context.Context, events *ebpf.Map) error {
+func handlePerfEvent(ctx context.Context, events, stackMap *ebpf.Map) error {
+	addrs, err := GetAddrs()
+	if err != nil {
+		log.Printf("Failed to get addrs: %v", err)
+		return fmt.Errorf("get addrs: %w", err)
+	}
+
 	eventReader, err := perf.NewReader(events, 4096)
 	if err != nil {
 		log.Printf("Failed to create perf-event reader: %v", err)
@@ -146,10 +200,13 @@ func handlePerfEvent(ctx context.Context, events *ebpf.Map) error {
 	}()
 
 	var ev struct {
-		Saddr [4]byte
-		Daddr [4]byte
-		Type  evType
-		Rand  uint32
+		Saddr   [4]byte
+		Daddr   [4]byte
+		Type    evType
+		Rand    uint32
+		Seq     uint16
+		CPU     uint16
+		StackID int64
 	}
 	for {
 		event, err := eventReader.Read()
@@ -167,8 +224,27 @@ func handlePerfEvent(ctx context.Context, events *ebpf.Map) error {
 
 		binary.Read(bytes.NewBuffer(event.RawSample), binary.LittleEndian, &ev)
 
-		// log.Printf("Event: %s, %s -> %s, rand: %d", ev.Type,
-		// 	netip.AddrFrom4(ev.Saddr), netip.AddrFrom4(ev.Daddr), ev.Rand)
+		// log.Printf("Event: %s, %s -> %s, CPU: %d, seq: %d, rand: %d", ev.Type,
+		// 	netip.AddrFrom4(ev.Saddr), netip.AddrFrom4(ev.Daddr),
+		// 	ev.CPU, ev.Seq, ev.Rand)
+
+		if ev.StackID > 0 {
+			const MaxStackDepth = 50
+			type StackData struct {
+				IPs [MaxStackDepth]uint64
+			}
+
+			var stack StackData
+			if err := stackMap.Lookup(uint32(ev.StackID), &stack); err == nil {
+				for _, ip := range stack.IPs {
+					if ip > 0 {
+						log.Printf("\t%s", addrs.findNearestSym(ip))
+					}
+				}
+			} else {
+				log.Printf("Failed to lookup stack: %v", err)
+			}
+		}
 
 		select {
 		case <-ctx.Done():
@@ -182,21 +258,21 @@ type evType uint32
 
 const (
 	evTypeDefault evType = iota
+	evTypeNetDevEnqueue
+	evTypeQdiscRun
 	evTypeQdiscDequeue
-	evTypeNetDevStartXmit
-	evTypeNetDevXmit
 )
 
 func (t evType) String() string {
 	switch t {
 	case evTypeDefault:
 		return "default"
+	case evTypeNetDevEnqueue:
+		return "net_dev_enqueue"
+	case evTypeQdiscRun:
+		return "__qdisc_run"
 	case evTypeQdiscDequeue:
 		return "qdisc_dequeue"
-	case evTypeNetDevStartXmit:
-		return "net_dev_start_xmit"
-	case evTypeNetDevXmit:
-		return "net_dev_xmit"
 	default:
 		return "unknown"
 	}

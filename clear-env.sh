@@ -9,3 +9,5 @@ NS_STUCK2="stuck2"
 
 ip netns del $NS_STUCK1
 ip netns del $NS_STUCK2
+
+sysctl -w net.core.dev_weight=64

@@ -41,6 +41,9 @@ ip neigh add dev ${VETH_STUCK2} ${IP_STUCK1} lladdr ${MAC_STUCK1} nud permanent
 ip route add dev ${VETH_STUCK2} default via ${IP_STUCK1}
 "
 
+sysctl net.core.dev_weight
+sysctl -w net.core.dev_weight=1 # default 64, 1 to run __netif_schedule() every time
+
 echo "To destroy the netns evn:"
 echo "ip netns del $NS_STUCK1"
 echo "ip netns del $NS_STUCK2"

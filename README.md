@@ -9,13 +9,13 @@ Above all, I had to read the kernel source code to figure out how does the pfifo
 ```c
 __dev_queue_xmit()    // ${KERNEL}/net/core/dev.c
 |-->__dev_xmit_skb() {
-        if (q->flags & TCQ_F_NOLOCK) {
-            rc = q->enqueue(skb, q, &to_free) & NET_XMIT_MASK;
-            qdisc_run(q);
-            if (unlikely(to_free))
-                kfree_skb_list(to_free);
-            return rc;
-        }
+    |   if (q->flags & TCQ_F_NOLOCK) {
+    |       rc = q->enqueue(skb, q, &to_free) & NET_XMIT_MASK;
+    |       qdisc_run(q);
+    |       if (unlikely(to_free))
+    |           kfree_skb_list(to_free);
+    |       return rc;
+    |   }
     }
     |-->qdisc_run()   // ${KERNEL}/include/net/pkt_sched.h
         |-->qdisc_run_begin() {
@@ -25,15 +25,23 @@ __dev_queue_xmit()    // ${KERNEL}/net/core/dev.c
         |           WRITE_ONCE(qdisc->empty, false);
         |       }
         |   }
-        |-->__qdisc_run()   // ${KERNEL}/net/sched/sch_generic.c
+        |-->__qdisc_run() {  // ${KERNEL}/net/sched/sch_generic.c
+        |   |   int quota = dev_tx_weight;
+        |   |   int packets;
+        |   |
+        |   |   while (qdisc_restart(q, &packets)) {
+        |   |       quota -= packets;
+        |   |       if (quota <= 0) {
+        |   |           __netif_schedule(q);
+        |   |           break;
+        |   |       }
+        |   |   }
+        |   }
         |   |-->qdisc_restart()
-        |       |-->sch_direct_xmit()
-        |           |-->dev_hard_start_xmit()   // ${KERNEL}/net/core/dev.c
-        |               |-->xmit_one() {
-        |                       trace_net_dev_start_xmit(skb, dev);
-        |                       rc = netdev_start_xmit(skb, dev, txq, more);
-        |                       trace_net_dev_xmit(skb, rc, dev, len);
-        |                   }
+        |   |   |-->dequeue_skb()
+        |   |   |   |-->trace_qdisc_dequeue()
+        |   |   |-->sch_direct_xmit()
+        |   |-->__netif_schedule()
         |-->qdisc_run_end() {
                 if (qdisc->flags & TCQ_F_NOLOCK)
                     spin_unlock(&qdisc->seqlock);
@@ -46,17 +54,17 @@ With this code snippet, the issue may be a little easy to reproduce by making a 
 
 ![Patckets stuck in pfifo_fast qdisc](./pkt-stucker.png)
 
-The key is to make packets stuck in `sch_direct_xmit()`.
+The key is to make packets stuck between `sch_direct_xmit()` and `qdisc_run_end()`.
 
-With recognizing some tracepoints/kprobes in `sch_direct_xmit()` procedure, it’s easy to cost some CPU with eBPF in the tracepoints/kprobes.
+With eBPF `fexit` on `__qdisc_run`, it’s easy to cost some CPU.
 
 Then, intervally, two `goroutine`s do send ICMP ECHO packets to do ping.
 
-So, as expected, one packet should be stuck in `sch_direct_xmit()`, and the other one should be enqueued and the packet handing should finish at `qdisc_run_begin()` then return early.
+So, as expected, one packet should be stuck in `fexit` on `__qdisc_run`, and the other one should be enqueued and the packet handing should finish at `qdisc_run_begin()` then return early.
 
 > The experiment environment:
 >
-> It’s a Virtualbox VM with Debian 11 (bullseye) system with 4 CPU.
+> It’s a QEMU VM with Debian 11 (bullseye) system with 4 CPU.
 
 ```shell
 # cat /etc/os-release
@@ -122,34 +130,95 @@ Homebrew LLVM version 15.0.7
     xcore      - XCore
 ```
 
-## Unexpected experiment case
+## Expected packets behaviour
 
-But, the world does not work expectedly.
+By sending two packets at the same time, one should be stuck and the other one
+should be enqueued and handled later.
 
-```shell
-# ./pkt-stucker -r 192.168.1.2
-2023/07/26 22:29:42.119848 Attached tracepoint(net:net_dev_start_xmit))
-2023/07/26 22:29:42.120646 Attached tracepoint(net:net_dev_xmit))
-2023/07/26 22:29:42.122134 Listening events...
-2023/07/26 22:29:42.122615 Ticking every 10ms to send packets
-2023/07/26 22:29:42.122921 Recving packets
-2023/07/26 22:29:42.123057 Sending packets on CPU 1 in stuck1 netns
-2023/07/26 22:29:42.129358 Sending packets on CPU 3 in stuck1 netns
-2023/07/26 22:29:42.133930 Sent packet on CPU 1 with seq 100, cost 538.504µs
-256 bytes from 192.168.1.2: icmp_seq=100 time=974.026µs
-2023/07/26 22:29:42.147394 Sent packet on CPU 1 with seq 102, cost 503.232µs
-256 bytes from 192.168.1.2: icmp_seq=102 time=75.845895ms (Bingo)
-2023/07/26 22:29:42.195977 Sent packet on CPU 3 with seq 101, cost 672.386µs
-2023/07/26 22:29:42.226659 Error: found a packet cost 75.845895ms
-
-# cat /sys/kernel/debug/tracing/trace_pipe
-     pkt-stucker-332947  [001] d... 18578.382391: bpf_trace_printk: net_dev_start_xmit on CPU 1, seq: 100, ts: 18582188406462
-     pkt-stucker-332947  [001] d... 18578.382629: bpf_trace_printk: net_dev_xmit on CPU 1, seq: 100, ts: 18582188650031
-     pkt-stucker-332947  [001] d... 18578.395846: bpf_trace_printk: net_dev_start_xmit on CPU 1, seq: 102, ts: 18582201870819
-     pkt-stucker-332947  [001] d... 18578.396040: bpf_trace_printk: net_dev_xmit on CPU 1, seq: 102, ts: 18582202066973
-     pkt-stucker-332943  [003] d... 18578.444378: bpf_trace_printk: net_dev_start_xmit on CPU 3, seq: 101, ts: 18582250428892
-     pkt-stucker-332943  [003] d... 18578.444644: bpf_trace_printk: net_dev_xmit on CPU 3, seq: 101, ts: 18582250695454
+```bash
+# ./pkt-stucker
+2023/08/02 12:25:36.039502 Attached fentry(__qdisc_run)
+2023/08/02 12:25:36.044562 Attached fexit(__qdisc_run)
+2023/08/02 12:25:36.046461 Attached fexit(__dev_queue_xmit)
+2023/08/02 12:25:36.048453 Attached fentry(__netif_schedule)
+2023/08/02 12:25:36.051010 Attached fentry(__pfifo_fast_dequeue)
+2023/08/02 12:25:36.053803 Attached fexit(__pfifo_fast_dequeue)
+2023/08/02 12:25:36.056199 Attached fentry(__pfifo_fast_enqueue)
+2023/08/02 12:25:36.058778 Attached fexit(__pfifo_fast_enqueue)
+2023/08/02 12:25:36.061253 Attached fentry(__net_tx_action)
+2023/08/02 12:25:36.064454 Attached fexit(__net_tx_action)
+2023/08/02 12:25:36.067556 Attached fentry(__sch_direct_xmit)
+2023/08/02 12:25:36.068366 Attached tracepoint(qdisc:qdisc_dequeue)
+2023/08/02 12:25:36.068704 Attached tracepoint(net:net_dev_queue)
+2023/08/02 12:25:36.071864 Ticking every 1s to send packets
+2023/08/02 12:25:36.079277 Recving packets
+2023/08/02 12:25:36.079529 Sending packets on CPU 3 in stuck1 netns
+2023/08/02 12:25:36.080076 Recving packets
+2023/08/02 12:25:36.084187 Sending packets on CPU 1 in stuck1 netns
+2023/08/02 12:25:36.169146 Listening events...
+2023/08/02 12:25:37.074156 Sent packet on CPU 1 with seq 100, cost 802.136µs
+256 bytes from 192.168.1.2: icmp_seq=100 time=884.061µs
+2023/08/02 12:25:37.074442 Sent packet on CPU 3 with seq 101, cost 456.139µs
+256 bytes from 192.168.1.2: icmp_seq=101 time=593.867µs
+2023/08/02 12:25:38.074116 Sent packet on CPU 3 with seq 103, cost 143.246µs
+2023/08/02 12:25:38.075233 Sent packet on CPU 1 with seq 102, cost 1.558596ms
+256 bytes from 192.168.1.2: icmp_seq=103 time=1.398867ms
+256 bytes from 192.168.1.2: icmp_seq=102 time=1.719791ms
+2023/08/02 12:25:39.073965 Sent packet on CPU 3 with seq 105, cost 106.51µs
+2023/08/02 12:25:39.074483 Sent packet on CPU 1 with seq 104, cost 1.15002ms
+256 bytes from 192.168.1.2: icmp_seq=104 time=1.332377ms
+256 bytes from 192.168.1.2: icmp_seq=105 time=813.38µs
 ```
+
+As the above log shows, the packets with seq 103 and 105 are stuck in the
+`fexit` on `__qdisc_run` and the packets with seq 102 and 104 are enqueued and
+handled later.
+
+With the `trace_pipe` in another terminal, the packets behaviour is more clear.
+
+```bash
+# cat /sys/kernel/debug/tracing/trace_pipe
+pkt-stucker-450580  [001] d... 67082.630302: bpf_trace_printk: handle_net_dev_queue on CPU 1, seq: 104
+pkt-stucker-450580  [001] d... 67082.630499: bpf_trace_printk: fentry_pfifo_fast_enqueue on CPU 1, seq: 104
+pkt-stucker-450580  [001] d... 67082.630502: bpf_trace_printk: fexit_pfifo_fast_enqueue on CPU 1, seq: 104
+pkt-stucker-450580  [001] d... 67082.630505: bpf_trace_printk: fentry__qdisc_run on CPU 1, seq: 104
+pkt-stucker-450580  [001] d... 67082.630507: bpf_trace_printk: fentry_pfifo_fast_dequeue on CPU 1, seq: 104
+pkt-stucker-450580  [001] d... 67082.630509: bpf_trace_printk: fexit_pfifo_fast_dequeue on CPU 1, seq: 104
+pkt-stucker-450580  [001] d... 67082.630511: bpf_trace_printk: fentry_pfifo_fast_dequeue on CPU 1, seq: 104
+pkt-stucker-450580  [001] d... 67082.630512: bpf_trace_printk: fexit_pfifo_fast_dequeue on CPU 1, seq: 104
+pkt-stucker-450580  [001] d... 67082.630517: bpf_trace_printk: handle_qdisc_dequeue on CPU 1, seq: 104, packets: 1
+pkt-stucker-450580  [001] d... 67082.630519: bpf_trace_printk: fentry_sch_direct_xmit on CPU 1
+pkt-stucker-450580  [001] d... 67082.630525: bpf_trace_printk: fentry__netif_schedule on CPU 1, pid: 450571
+pkt-stucker-450580  [001] d... 67082.630816: bpf_trace_printk: fexit__qdisc_run on CPU 1, seq: 104
+pkt-stucker-450581  [003] d... 67082.630865: bpf_trace_printk: handle_net_dev_queue on CPU 3, seq: 105
+pkt-stucker-450581  [003] d... 67082.630868: bpf_trace_printk: fentry_pfifo_fast_enqueue on CPU 3, seq: 105
+pkt-stucker-450581  [003] d... 67082.630869: bpf_trace_printk: fexit_pfifo_fast_enqueue on CPU 3, seq: 105
+pkt-stucker-450581  [003] d... 67082.630871: bpf_trace_printk: fexit__dev_queue_xmit on CPU 3, seq: 105
+pkt-stucker-450580  [001] dN.. 67082.630885: bpf_trace_printk: fentry__netif_schedule on CPU 1, pid: 450571
+pkt-stucker-450580  [001] dNs1 67082.630890: bpf_trace_printk: fentry__qdisc_run on CPU 1, seq: 0, from net_tx_action
+pkt-stucker-450580  [001] dNs1 67082.630893: bpf_trace_printk: handle_qdisc_dequeue on CPU 1, seq: 105, packets: 1
+pkt-stucker-450580  [001] dNs1 67082.630894: bpf_trace_printk: fentry_sch_direct_xmit on CPU 1
+pkt-stucker-450580  [001] dNs1 67082.630896: bpf_trace_printk: fentry__netif_schedule on CPU 1, pid: 450571
+pkt-stucker-450580  [001] dNs1 67082.631161: bpf_trace_printk: fexit__qdisc_run on CPU 1, seq: 105
+ksoftirqd/1-18      [001] d.s. 67082.631252: bpf_trace_printk: fentry__qdisc_run on CPU 1, seq: 0, from net_tx_action
+```
+
+As the above log shows, the packets with seq 104 and 105 are handled by CPU 1.
+
+However, the packet with seq 104 is handled in the context of sending the
+packet. And the packet with seq 105 is handled in the context of `ksoftirqd/1`,
+which is softirq **NET_TX_SOFTIRQ** context. That's because there is a packet
+quota in `__qdisc_run()` to determine whether to schedule the softirq
+**NET_TX_SOFTIRQ**, or try to dequeue from the `txq` again.
+
+By imaging a MySQL case, for a packet of the MySQL request:
+
+1. It's enqueued to the `txq`.
+2. The quota has been drained.
+3. A **NET_TX_SOFTIRQ** is scheduled.
+4. But the **NET_TX_SOFTIRQ** is heavy to schedule to handle the packet.
+
+As a result, the MySQL session behaves stuck.
 
 ## Run the demo
 
@@ -163,7 +232,7 @@ When the 4-CPUs VM prepares, run the demo:
 # go build
 # bash setup-env.sh
 # echo "bash clear-env.sh finally"
-# ./pkt-stucker -r 192.168.1.2
+# ./pkt-stucker
 #
 # echo In another terminal
 # cat /sys/kernel/debug/tracing/trace_pipe
@@ -171,6 +240,4 @@ When the 4-CPUs VM prepares, run the demo:
 
 ## In conclusion
 
-Wow, congrad, the issue is reproduced.
-
-Fake it. This is a way to reproduce the issue.
+Wow, congrats, the packet stuck behaviour is reproduced.

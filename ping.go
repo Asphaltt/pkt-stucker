@@ -6,11 +6,13 @@ package main
 import (
 	"context"
 	"crypto/rand"
+	"errors"
 	"fmt"
 	"log"
 	"net"
 	"runtime"
 	"sync"
+	"syscall"
 	"time"
 	"unsafe"
 
@@ -24,19 +26,21 @@ import (
 
 type pinging struct {
 	remote string
-	conn   *icmp.PacketConn
+	udpLis *net.UDPConn
 
 	ids []int
 
 	smu      sync.Mutex
 	sendings map[int]time.Time
 
+	singleSend bool
+
 	nsMain   netns.NsHandle
 	nsStuck1 netns.NsHandle
 	nsStuck2 netns.NsHandle
 }
 
-func newPinging(remote string) (*pinging, error) {
+func newPinging(remote string, single bool) (*pinging, error) {
 	var p pinging
 
 	var err error
@@ -57,7 +61,7 @@ func newPinging(remote string) (*pinging, error) {
 
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
-	if err := netns.Set(p.nsStuck1); err != nil {
+	if err := netns.Set(p.nsStuck2); err != nil {
 		return nil, fmt.Errorf("set stuck1 netns: %w", err)
 	}
 	defer func() {
@@ -66,14 +70,15 @@ func newPinging(remote string) (*pinging, error) {
 		}
 	}()
 
-	conn, err := icmp.ListenPacket("ip4:icmp", "0.0.0.0")
+	conn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4zero, Port: 2345})
 	if err != nil {
-		return nil, fmt.Errorf("listen error: %w", err)
+		return nil, fmt.Errorf("listen UDP: %w", err)
 	}
 
 	p.remote = remote
-	p.conn = conn
+	p.udpLis = conn
 	p.sendings = make(map[int]time.Time)
+	p.singleSend = single
 
 	return &p, nil
 }
@@ -82,7 +87,7 @@ func (p *pinging) close() error {
 	_ = p.nsMain.Close()
 	_ = p.nsStuck1.Close()
 	_ = p.nsStuck2.Close()
-	return p.conn.Close()
+	return p.udpLis.Close()
 }
 
 func (p *pinging) stuck1NetnsIno() (uint32, error) {
@@ -112,11 +117,11 @@ func (p *pinging) run(ctx context.Context) error {
 	errg, ctx := errgroup.WithContext(ctx)
 
 	errg.Go(func() error {
-		return p.runSending(ctx, ch1, ch2, ch3)
+		return p.listen(ctx)
 	})
 
 	errg.Go(func() error {
-		return p.recv(ctx)
+		return p.runSending(ctx, ch1, ch2, ch3)
 	})
 
 	errg.Go(func() error {
@@ -127,13 +132,13 @@ func (p *pinging) run(ctx context.Context) error {
 	return errg.Wait()
 }
 
-const tickInterval = 20 * time.Millisecond
+const tickInterval = 1000 * time.Millisecond
 
 func (p *pinging) tick(ctx context.Context, ch1, ch3 chan int) {
 	ticker := time.NewTicker(tickInterval)
 	defer ticker.Stop()
 
-	log.Printf("Ticking every 10ms to send packets")
+	log.Printf("Ticking every %s to send packets", tickInterval)
 
 	var seq int = 100
 
@@ -155,17 +160,29 @@ func (p *pinging) runSending(ctx context.Context, ch1, ch2, ch3 chan int) error 
 	errg, ctx := errgroup.WithContext(ctx)
 
 	errg.Go(func() error {
-		return p.send(ctx, 1, ch1, ch2)
+		return p.send(ctx, 1, 0, ch1, ch2)
 	})
 
-	errg.Go(func() error {
-		return p.send(ctx, 3, ch2, ch3)
-	})
+	if p.singleSend {
+		errg.Go(func() error {
+			for {
+				select {
+				case <-ctx.Done():
+					return nil
+				case <-ch2:
+				}
+			}
+		})
+	} else {
+		errg.Go(func() error {
+			return p.send(ctx, 3, 1, ch2, ch3)
+		})
+	}
 
 	return errg.Wait()
 }
 
-func (p *pinging) send(ctx context.Context, cpu int, chIn, chOut chan int) error {
+func (p *pinging) send(ctx context.Context, cpu, tos int, chIn, chOut chan int) error {
 	remote, err := net.ResolveIPAddr("ip", p.remote)
 	if err != nil {
 		return fmt.Errorf("resolve remote address: %w", err)
@@ -184,6 +201,24 @@ func (p *pinging) send(ctx context.Context, cpu int, chIn, chOut chan int) error
 			err = fmt.Errorf("set main netns: %w", er)
 		}
 	}()
+
+	dialer := net.Dialer{}
+	dialer.Control = func(network, address string, c syscall.RawConn) error {
+		var err error
+		c.Control(func(fd uintptr) {
+			err = syscall.SetsockoptInt(int(fd), syscall.IPPROTO_IP, syscall.IP_TOS, tos)
+		})
+		return err
+	}
+
+	c, err := dialer.DialContext(ctx, "udp", fmt.Sprintf("%s:2345", remote.IP.String()))
+	if err != nil {
+		return fmt.Errorf("dial UDP: %w", err)
+	}
+	defer c.Close()
+
+	conn := c.(*net.UDPConn)
+	go p.recv(ctx, conn)
 
 	// Set CPU affinity
 	var cpuSet unix.CPUSet
@@ -233,7 +268,7 @@ func (p *pinging) send(ctx context.Context, cpu int, chIn, chOut chan int) error
 		p.sendings[echo.Seq] = time.Now()
 		p.smu.Unlock()
 
-		if _, err := p.conn.WriteTo(b, remote); err != nil {
+		if _, err := conn.Write(b); err != nil {
 			return fmt.Errorf("write ICMP echo msg: %w", err)
 		}
 
@@ -241,7 +276,7 @@ func (p *pinging) send(ctx context.Context, cpu int, chIn, chOut chan int) error
 	}
 }
 
-func (p *pinging) recv(ctx context.Context) error {
+func (p *pinging) recv(ctx context.Context, conn *net.UDPConn) error {
 	var b [1500]byte
 
 	log.Printf("Recving packets")
@@ -253,24 +288,14 @@ func (p *pinging) recv(ctx context.Context) error {
 		default:
 		}
 
-		n, peer, err := p.conn.ReadFrom(b[:])
+		n, err := conn.Read(b[:])
 		if err != nil {
 			return fmt.Errorf("read ICMP echo reply msg: %w", err)
-		}
-
-		if peer.String() != p.remote {
-			log.Printf("Dropped by wrong peer")
-			continue
 		}
 
 		msg, err := icmp.ParseMessage(ipv4.ICMPTypeEchoReply.Protocol(), b[:n])
 		if err != nil {
 			return fmt.Errorf("parse ICMP echo reply msg: %w", err)
-		}
-
-		if msg.Type != ipv4.ICMPTypeEchoReply {
-			log.Printf("Dropped by wrong type")
-			continue
 		}
 
 		echo, ok := msg.Body.(*icmp.Echo)
@@ -301,5 +326,29 @@ func (p *pinging) recv(ctx context.Context) error {
 		}
 
 		fmt.Printf("%d bytes from %s: icmp_seq=%d time=%v\n", n-8, p.remote, echo.Seq, cost)
+	}
+}
+
+func (p *pinging) listen(ctx context.Context) error {
+	var buf [1500]byte
+
+	for {
+		n, remote, err := p.udpLis.ReadFromUDP(buf[:])
+		if err != nil {
+			if errors.Is(err, net.ErrClosed) {
+				return nil
+			}
+
+			log.Printf("Read UDP packet: %v", err)
+			continue
+		}
+
+		select {
+		case <-ctx.Done():
+			return nil
+		default:
+		}
+
+		_, _ = p.udpLis.WriteToUDP(buf[:n], remote)
 	}
 }
