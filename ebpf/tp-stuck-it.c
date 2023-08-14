@@ -204,7 +204,7 @@ static __noinline u32
 __consume_cpu(u32 rnd)
 {
     rnd = rnd ? : bpf_get_prandom_u32();
-    for (int i = 0; i < 5; i++)
+    for (int i = 0; i < 4; i++)
         rnd = __compute_hash(rnd);
     return rnd;
 }
@@ -326,17 +326,6 @@ int BPF_PROG(fentry__qdisc_run, struct Qdisc *qdisc)
     return BPF_OK;
 }
 
-static const u8 __ksoftirqd_prefix[] = "ksoftirqd/";
-
-static __always_inline bool
-__is_ksoftirqd(void)
-{
-    u8 comm[16] = {};
-
-    bpf_get_current_comm(&comm, sizeof(comm));
-    return __builtin_memcmp(comm, __ksoftirqd_prefix, sizeof(__ksoftirqd_prefix) - 1) == 0;
-}
-
 SEC("fexit/__qdisc_run")
 int BPF_PROG(fexit__qdisc_run, struct Qdisc *qdisc, int retval)
 {
@@ -348,34 +337,14 @@ int BPF_PROG(fexit__qdisc_run, struct Qdisc *qdisc, int retval)
     u16 seq = pkt ? __handle_pkt(ctx, pkt, TP_TYPE_QDISC_RUN, 0) : 0;
 
     u64 ids = bpf_get_current_pid_tgid();
-    u32 thread = (u32) ids;
     u32 pid = (u32) (ids >> 32);
     bpf_map_delete_elem(&pkt_mark, &pid);
 
-    u32 *val = bpf_map_lookup_and_delete(&net_tx_action_mark, &thread);
-    bool is_net_tx_action = val && *val == 0;
-
-    u32 cpu = bpf_get_smp_processor_id();
-
-    if (is_net_tx_action) {
-        bool is_ksoftirqd = __is_ksoftirqd();
-        if (is_ksoftirqd) {
-            bpf_printk("fexit__qdisc_run on CPU %d, ts: %llu, from ksoftirqd\n",
-                cpu, bpf_ktime_get_ns());
-            // u32 rnd = __consume_cpu(0);
-            u32 rnd = bpf_get_prandom_u32();
-            bpf_printk("fexit__qdisc_run on CPU %d, ts: %llu, rnd: %lu, from ksoftirqd\n",
-                cpu, bpf_ktime_get_ns(), rnd);
-        } else {
-            bpf_printk("fexit__qdisc_run on CPU %d, ts: %llu, from net_tx_action\n",
-                cpu, bpf_ktime_get_ns());
-            u32 rnd = __consume_cpu(0);
-            bpf_printk("fexit__qdisc_run on CPU %d, ts: %llu, rnd: %lu, from net_tx_action\n",
-                cpu, bpf_ktime_get_ns(), rnd);
-        }
-    } else
-        bpf_printk("fexit__qdisc_run on CPU %d, seq: %d\n",
-            cpu, seq);
+    bpf_printk("fexit__qdisc_run on seq: %d, ts: %llu, no rnd\n",
+        seq, bpf_ktime_get_ns());
+    u32 rnd = __consume_cpu(0);
+    bpf_printk("fexit__qdisc_run on seq: %d, ts: %llu, rnd: %lu\n",
+        seq, bpf_ktime_get_ns(), rnd);
 
     return BPF_OK;
 }

@@ -254,9 +254,9 @@ func (p *pinging) send(ctx context.Context, cpu, tos int, chIn, chOut chan int) 
 			}
 		}
 
-		if cpu == 3 {
-			time.Sleep(10 * time.Microsecond)
-		}
+		// if cpu == 3 {
+		// 	time.Sleep(10 * time.Microsecond)
+		// }
 
 		started := time.Now()
 
