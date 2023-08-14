@@ -60,6 +60,7 @@ enum __tp_type {
     TP_TYPE_NET_DEV_ENQUEUE,
     TP_TYPE_QDISC_RUN,
     TP_TYPE_QDISC_DEQUEUE,
+    TP_TYPE_NETIF_SCHEDULE,
 };
 
 typedef struct event {
@@ -99,6 +100,12 @@ struct {
     __uint(value_size, MAX_STACK_DEPTH * sizeof(u64));
 } stack_map SEC(".maps");
 
+static __always_inline u32
+__get_stack_id(void *ctx)
+{
+    return bpf_get_stackid(ctx, &stack_map, BPF_F_FAST_STACK_CMP);
+}
+
 static __noinline u32 __compute_hash(u32 initval)
 {
     int i = 0;
@@ -128,6 +135,9 @@ __is_veth_veth1(struct net_device *dev)
 static __always_inline bool
 __is_stuck_qdisc(struct Qdisc *qdisc)
 {
+    if (!qdisc)
+        return false;
+
     struct net_device *dev = BPF_CORE_READ(qdisc, dev_queue, dev);
     return __is_veth_veth1(dev);
 }
@@ -190,6 +200,15 @@ __is_pkt(struct sk_buff *skb, struct pkt_info *pkt)
     return true;
 }
 
+static __noinline u32
+__consume_cpu(u32 rnd)
+{
+    rnd = rnd ? : bpf_get_prandom_u32();
+    for (int i = 0; i < 5; i++)
+        rnd = __compute_hash(rnd);
+    return rnd;
+}
+
 static __always_inline __u16
 __handle_pkt(void *ctx, struct pkt_info *pkt, enum __tp_type type, s64 stack_id)
 {
@@ -203,9 +222,8 @@ __handle_pkt(void *ctx, struct pkt_info *pkt, enum __tp_type type, s64 stack_id)
     ev.cpu = (__u16)bpf_get_smp_processor_id();
 
     u32 rnd = bpf_get_prandom_u32();
-    if (!stack_id)
-        for (int i = 0; i < 5; i++)
-            rnd = __compute_hash(rnd);
+    // if (!stack_id)
+    //     rnd = __consume_cpu(rnd);
     ev.rand = rnd;
 
     bpf_perf_event_output(ctx, &events, BPF_F_CURRENT_CPU, &ev, sizeof(ev));
@@ -223,8 +241,8 @@ int handle_net_dev_queue(struct net_dev_queue_ctx *ctx)
         u64 ids = bpf_get_current_pid_tgid();
         // u32 thread = (u32) ids;
         u32 pid = (u32) (ids >> 32);
-        bpf_printk("handle_net_dev_queue on CPU %d, seq: %d\n",
-            bpf_get_smp_processor_id(), pkt.seq);
+        bpf_printk("handle_net_dev_queue on CPU %d, seq: %d, ts: %llu\n",
+            bpf_get_smp_processor_id(), pkt.seq, bpf_ktime_get_ns());
 
         bpf_map_update_elem(&pkt_mark, &pid, &pkt.seq, BPF_ANY);
     }
@@ -299,13 +317,24 @@ int BPF_PROG(fentry__qdisc_run, struct Qdisc *qdisc)
     u16 *seq = bpf_map_lookup_elem(&pkt_mark, &pid);
     u16 _seq = seq ? *seq : 0;
     if (is_net_tx_action)
-        bpf_printk("fentry__qdisc_run on CPU %d, seq: %d, from net_tx_action\n",
-            cpu, _seq);
+        bpf_printk("fentry__qdisc_run on CPU %d, seq: %d, next sched: %d, from net_tx_action\n",
+            cpu, _seq, __is_stuck_qdisc(BPF_CORE_READ(qdisc, next_sched)));
     else
         bpf_printk("fentry__qdisc_run on CPU %d, seq: %d\n",
             cpu, _seq);
 
     return BPF_OK;
+}
+
+static const u8 __ksoftirqd_prefix[] = "ksoftirqd/";
+
+static __always_inline bool
+__is_ksoftirqd(void)
+{
+    u8 comm[16] = {};
+
+    bpf_get_current_comm(&comm, sizeof(comm));
+    return __builtin_memcmp(comm, __ksoftirqd_prefix, sizeof(__ksoftirqd_prefix) - 1) == 0;
 }
 
 SEC("fexit/__qdisc_run")
@@ -323,15 +352,28 @@ int BPF_PROG(fexit__qdisc_run, struct Qdisc *qdisc, int retval)
     u32 pid = (u32) (ids >> 32);
     bpf_map_delete_elem(&pkt_mark, &pid);
 
-    u32 *val = bpf_map_lookup_elem(&net_tx_action_mark, &thread);
+    u32 *val = bpf_map_lookup_and_delete(&net_tx_action_mark, &thread);
     bool is_net_tx_action = val && *val == 0;
 
     u32 cpu = bpf_get_smp_processor_id();
 
-    if (is_net_tx_action)
-        bpf_printk("fexit__qdisc_run on CPU %d, seq: %d, from net_tx_action\n",
-            cpu, seq);
-    else
+    if (is_net_tx_action) {
+        bool is_ksoftirqd = __is_ksoftirqd();
+        if (is_ksoftirqd) {
+            bpf_printk("fexit__qdisc_run on CPU %d, ts: %llu, from ksoftirqd\n",
+                cpu, bpf_ktime_get_ns());
+            // u32 rnd = __consume_cpu(0);
+            u32 rnd = bpf_get_prandom_u32();
+            bpf_printk("fexit__qdisc_run on CPU %d, ts: %llu, rnd: %lu, from ksoftirqd\n",
+                cpu, bpf_ktime_get_ns(), rnd);
+        } else {
+            bpf_printk("fexit__qdisc_run on CPU %d, ts: %llu, from net_tx_action\n",
+                cpu, bpf_ktime_get_ns());
+            u32 rnd = __consume_cpu(0);
+            bpf_printk("fexit__qdisc_run on CPU %d, ts: %llu, rnd: %lu, from net_tx_action\n",
+                cpu, bpf_ktime_get_ns(), rnd);
+        }
+    } else
         bpf_printk("fexit__qdisc_run on CPU %d, seq: %d\n",
             cpu, seq);
 
@@ -348,11 +390,15 @@ int BPF_PROG(fentry__netif_schedule, struct Qdisc *qdisc)
     // u32 thread = (u32) ids;
     u32 pid = (u32) (ids >> 32);
     u16 *seq = bpf_map_lookup_elem(&pkt_mark, &pid);
-    if (!seq)
-        return BPF_OK;
 
+    u16 _seq = seq ? *seq : 0;
     bpf_printk("fentry__netif_schedule on CPU %d, seq: %d\n",
-        bpf_get_smp_processor_id(), *seq);
+        bpf_get_smp_processor_id(), _seq);
+
+    // struct pkt_info pkt = {};
+    // pkt.seq = _seq;
+    // u32 stack_id = __get_stack_id(ctx);
+    // __handle_pkt(ctx, &pkt, TP_TYPE_NETIF_SCHEDULE, stack_id);
 
     return BPF_OK;
 }

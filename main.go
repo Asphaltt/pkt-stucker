@@ -261,6 +261,7 @@ const (
 	evTypeNetDevEnqueue
 	evTypeQdiscRun
 	evTypeQdiscDequeue
+	evTypeNetifSchedule
 )
 
 func (t evType) String() string {
@@ -273,6 +274,8 @@ func (t evType) String() string {
 		return "__qdisc_run"
 	case evTypeQdiscDequeue:
 		return "qdisc_dequeue"
+	case evTypeNetifSchedule:
+		return "__netif_schedule"
 	default:
 		return "unknown"
 	}
